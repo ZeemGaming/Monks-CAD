@@ -4,7 +4,7 @@ import subprocess
 import asyncio
 import aiohttp
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Security, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +21,6 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Enable CORS for external website access (website.py / web dashboards)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,12 +29,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Optional API Security Key setup
 BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY", "")
 security = HTTPBearer(auto_error=False)
 
 async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
-    """Verifies the bearer token if BRIDGE_API_KEY is configured in environment."""
     if BRIDGE_API_KEY:
         if not credentials or credentials.credentials != BRIDGE_API_KEY:
             raise HTTPException(status_code=401, detail="Invalid or missing API key.")
@@ -50,11 +47,14 @@ class SSHCommand(BaseModel):
 class DirectoryRequest(BaseModel):
     path: Optional[str] = "."
 
+class ERLCCommandRequest(BaseModel):
+    command: str
+    server_key: Optional[str] = None
+
 # --- Startup Event ---
 
 @app.on_event("startup")
 async def log_outbound_ip():
-    """Logs public outbound IP on boot (useful for egress checks)."""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.ipify.org") as resp:
@@ -66,16 +66,32 @@ async def log_outbound_ip():
     except Exception as e:
         logger.error(f"Error fetching IP: {e}")
 
-# --- API Endpoints for website.py ---
+# --- API Endpoints ---
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def status():
-    """Health check endpoint for host and load balancer."""
     return {"status": "SSH Bridge Active", "authenticated": bool(BRIDGE_API_KEY)}
+
+@app.post("/api/erlc/command", dependencies=[Depends(verify_api_key)])
+async def execute_erlc_command(payload: ERLCCommandRequest):
+    """Executes ER:LC commands directly from Render's whitelisted outbound IP."""
+    key = payload.server_key or os.getenv("PRC_API_KEY") or os.getenv("ERLC_SERVER_KEY")
+    if not key:
+        raise HTTPException(status_code=400, detail="No ER:LC Server Key provided or found in environment variables.")
+
+    url = "https://api.erlc.gg/v2/server/command"
+    headers = {
+        "server-key": key,
+        "Content-Type": "application/json"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json={"command": payload.command}, headers=headers) as resp:
+            text = await resp.text()
+            return {"status_code": resp.status, "response": text}
 
 @app.get("/api/system/info", dependencies=[Depends(verify_api_key)])
 async def system_info():
-    """Returns basic system environment and working directory info."""
     return {
         "cwd": os.getcwd(),
         "user": os.getenv("USER", "unknown"),
@@ -85,7 +101,6 @@ async def system_info():
 
 @app.post("/exec", dependencies=[Depends(verify_api_key)])
 async def execute_shell(payload: SSHCommand):
-    """Synchronously executes a shell command and returns stdout/stderr."""
     try:
         result = subprocess.run(
             payload.command,
@@ -106,7 +121,6 @@ async def execute_shell(payload: SSHCommand):
 
 @app.post("/exec/async", dependencies=[Depends(verify_api_key)])
 async def execute_shell_async(payload: SSHCommand):
-    """Executes a long-running shell command asynchronously."""
     try:
         proc = await asyncio.create_subprocess_shell(
             payload.command,
@@ -126,7 +140,6 @@ async def execute_shell_async(payload: SSHCommand):
 
 @app.post("/api/files/list", dependencies=[Depends(verify_api_key)])
 async def list_files(payload: DirectoryRequest):
-    """Lists files and folders inside a specified directory for website navigation."""
     target_path = Path(payload.path or ".").resolve()
     if not target_path.exists():
         raise HTTPException(status_code=404, detail="Directory does not exist.")
@@ -145,7 +158,6 @@ async def list_files(payload: DirectoryRequest):
 
 @app.post("/api/files/upload", dependencies=[Depends(verify_api_key)])
 async def upload_file(destination: str = ".", file: UploadFile = File(...)):
-    """Allows website.py to upload files directly into the workspace."""
     try:
         target_dir = Path(destination).resolve()
         target_dir.mkdir(parents=True, exist_ok=True)
