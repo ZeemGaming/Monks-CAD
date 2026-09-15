@@ -1,19 +1,27 @@
 import os
 import logging
 import subprocess
+import asyncio
 import aiohttp
-from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Depends, Security, UploadFile, File
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-# Configure logging to print directly to stdout (visible in Render & Replit logs)
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SSH-Bridge")
 
-app = FastAPI(title="SSH & Replit Bridge Tool")
+app = FastAPI(
+    title="SSH & Replit Bridge API",
+    description="Full-featured management API for web dashboard integration.",
+    version="2.0.0"
+)
 
-# Enable CORS for remote requests and dashboard access
+# Enable CORS for external website access (website.py / web dashboards)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,8 +30,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Optional API Security Key setup
+BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY", "")
+security = HTTPBearer(auto_error=False)
+
+async def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(security)):
+    """Verifies the bearer token if BRIDGE_API_KEY is configured in environment."""
+    if BRIDGE_API_KEY:
+        if not credentials or credentials.credentials != BRIDGE_API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+    return True
+
+# --- Data Models ---
+
 class SSHCommand(BaseModel):
     command: str
+    timeout: Optional[int] = 30
+
+class DirectoryRequest(BaseModel):
+    path: Optional[str] = "."
+
+# --- Startup Event ---
 
 @app.on_event("startup")
 async def log_outbound_ip():
@@ -39,21 +66,33 @@ async def log_outbound_ip():
     except Exception as e:
         logger.error(f"Error fetching IP: {e}")
 
-# Handles GET and HEAD methods so Render's health checker gets 200 OK instead of 405
+# --- API Endpoints for website.py ---
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def status():
-    return {"status": "SSH Bridge Active"}
+    """Health check endpoint for host and load balancer."""
+    return {"status": "SSH Bridge Active", "authenticated": bool(BRIDGE_API_KEY)}
 
-@app.post("/exec")
+@app.get("/api/system/info", dependencies=[Depends(verify_api_key)])
+async def system_info():
+    """Returns basic system environment and working directory info."""
+    return {
+        "cwd": os.getcwd(),
+        "user": os.getenv("USER", "unknown"),
+        "python_version": os.getenv("PYTHON_VERSION", "3.x"),
+        "port": os.getenv("PORT", "8000")
+    }
+
+@app.post("/exec", dependencies=[Depends(verify_api_key)])
 async def execute_shell(payload: SSHCommand):
-    """Executes a shell command and returns stdout, stderr, and exit code."""
+    """Synchronously executes a shell command and returns stdout/stderr."""
     try:
         result = subprocess.run(
             payload.command,
             shell=True,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=payload.timeout
         )
         return {
             "stdout": result.stdout,
@@ -61,11 +100,65 @@ async def execute_shell(payload: SSHCommand):
             "returncode": result.returncode
         }
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=408, detail="Command execution timed out.")
+        raise HTTPException(status_code=408, detail=f"Command timed out after {payload.timeout}s.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/exec/async", dependencies=[Depends(verify_api_key)])
+async def execute_shell_async(payload: SSHCommand):
+    """Executes a long-running shell command asynchronously."""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            payload.command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=payload.timeout)
+        return {
+            "stdout": stdout.decode(),
+            "stderr": stderr.decode(),
+            "returncode": proc.returncode
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=408, detail=f"Async command timed out after {payload.timeout}s.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/files/list", dependencies=[Depends(verify_api_key)])
+async def list_files(payload: DirectoryRequest):
+    """Lists files and folders inside a specified directory for website navigation."""
+    target_path = Path(payload.path or ".").resolve()
+    if not target_path.exists():
+        raise HTTPException(status_code=404, detail="Directory does not exist.")
+    
+    try:
+        items = []
+        for item in target_path.iterdir():
+            items.append({
+                "name": item.name,
+                "is_dir": item.is_dir(),
+                "size_bytes": item.stat().st_size if item.is_file() else 0
+            })
+        return {"path": str(target_path), "items": items}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/files/upload", dependencies=[Depends(verify_api_key)])
+async def upload_file(destination: str = ".", file: UploadFile = File(...)):
+    """Allows website.py to upload files directly into the workspace."""
+    try:
+        target_dir = Path(destination).resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / file.filename
+        
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+            
+        return {"status": "File uploaded successfully", "filename": file.filename, "path": str(file_path)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Dynamically bind to PORT for Replit/Render compatibility (defaults to 8000)
     port = int(os.getenv("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
