@@ -1,32 +1,70 @@
 import os
+import logging
+import subprocess
 import aiohttp
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import uvicorn
 
-app = FastAPI(title="ER:LC CAD Backend API")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("SSH-Bridge")
 
-ERLC_SERVER_KEY = os.getenv("ERLC_SERVER_KEY", "RUcUFvbCdZBMnNwDMehN-ZOlCCPSreCQPrtvNHYMxZPbstkBxgplcHyKOoYXH")
-ERLC_BASE_URL = "https://api.erlc.gg/v1"
+app = FastAPI(title="SSH & Replit Bridge Tool")
 
-class CommandRequest(BaseModel):
+# Enable CORS for remote requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class SSHCommand(BaseModel):
     command: str
 
-@app.get("/")
-async def root():
-    return {"status": "Koyeb FastAPI Backend Active"}
+@app.on_event("startup")
+async def log_outbound_ip():
+    """Logs public outbound IP on boot (useful for Render/Replit egress checks)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.ipify.org") as resp:
+                if resp.status == 200:
+                    ip = await resp.text()
+                    logger.info(f"=== SSH BRIDGE PUBLIC IP: {ip} ===")
+                else:
+                    logger.warning("Failed to retrieve public IP address.")
+    except Exception as e:
+        logger.error(f"Error fetching IP: {e}")
 
-@app.post("/api/command")
-async def execute_command(payload: CommandRequest):
-    headers = {
-        "Server-Key": ERLC_SERVER_KEY,
-        "Content-Type": "application/json"
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{ERLC_BASE_URL}/server/command",
-            headers=headers,
-            json={"command": payload.command}
-        ) as resp:
-            if resp.status != 200:
-                raise HTTPException(status_code=resp.status, detail=await resp.text())
-            return await resp.json()
+@app.get("/")
+async def status():
+    return {"status": "SSH Bridge Active"}
+
+@app.post("/exec")
+async def execute_shell(payload: SSHCommand):
+    """Executes a local shell/SSH command and returns stdout/stderr."""
+    try:
+        result = subprocess.run(
+            payload.command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode
+        }
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=408, detail="Command execution timed out.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    # Dynamically bind to PORT for Replit/Render or default to 8000
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
