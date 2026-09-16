@@ -4,3 +4,4 @@ aiohttp
 pydantic
 python-multipart
 requests
+httpx
